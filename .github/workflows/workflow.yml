@@ -5,23 +5,89 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing stable source tag to publish (must match the package version)"
+        required: true
+        default: "v1.2.0"
+        type: string
+      publish:
+        description: "Publish after validation (requires the PyPI pending publisher)"
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pypi-release
+  cancel-in-progress: false
 
 jobs:
-  release:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify the release identity
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import tomllib
+          from pathlib import Path
+          import ctxkeeper
+
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          tag = os.environ["RELEASE_TAG"]
+          if tag != f"v{version}" or ctxkeeper.__version__ != version:
+              raise SystemExit("Release tag, package version and program version must agree")
+          ref = f"refs/tags/{tag}"
+          subprocess.run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], check=True)
+          # A manual release may add packaging checks without moving the stable tag.
+          # Every other tracked file must still match that reviewed source exactly.
+          subprocess.run([
+              "git", "diff", "--exit-code", ref, "HEAD", "--", ".",
+              ":(exclude).github/workflows/workflow.yml", ":(exclude)MANIFEST.in",
+          ], check=True)
+          print(f"Verified stable source {tag}")
+          PY
+      - name: Run the test suite
+        run: python -m unittest test_notesdelta test_ctxkeeper -q
+      - name: Build the distribution
+        run: |
+          python -m pip install build twine
+          python -m build
+          python -m twine check --strict dist/*
+      - name: Check installation of the built wheel
+        run: |
+          python -m venv /tmp/ctxkeeper-installed
+          /tmp/ctxkeeper-installed/bin/pip install --no-index --no-deps dist/*.whl
+          expected=$(python -c 'import ctxkeeper; print("ctxkeeper " + ctxkeeper.__version__)')
+          test "$(/tmp/ctxkeeper-installed/bin/ctxkeeper --version)" = "$expected"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: validate
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/download-artifact@v4
         with:
-          python-version: "3.12"
-      - name: Run the test suite
-        run: python -m unittest test_notesdelta test_ctxkeeper -q
-      - name: Build the distribution
-        run: |
-          python -m pip install --upgrade pip build
-          python -m build
+          name: distributions
+          path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
